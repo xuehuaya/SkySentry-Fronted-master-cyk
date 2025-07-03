@@ -387,6 +387,104 @@ function updateCoordinates (transformType: string, element: LayerResource) {
   }
 }
 
+// ====== 修改后的导出 KMZ (WPML格式)功能 ======
+
+// 将几何信息转换为航点列表
+function convertGeometryToWaypoints (geometry: any): Array<{lon: number, lat: number}> {
+  const waypoints: Array<{lon: number, lat: number}> = []
+
+  if (!geometry || !geometry.coordinates) {
+    return waypoints
+  }
+
+  const type = geometry.type
+
+  if (type === 'Point') {
+    // 单点
+    const [lon, lat] = geometry.coordinates
+    waypoints.push({ lon, lat })
+  } else if (type === 'LineString') {
+    // 线路 - 将线上的点作为航点
+    geometry.coordinates.forEach((coord: number[]) => {
+      const [lon, lat] = coord
+      waypoints.push({ lon, lat })
+    })
+  } else if (type === 'Polygon') {
+    // 多边形 - 将外环的点作为航点
+    const ring = geometry.coordinates[0] // 取外环
+    ring.forEach((coord: number[], index: number) => {
+      // 跳过最后一个点（与第一个点重复）
+      if (index < ring.length - 1) {
+        const [lon, lat] = coord
+        waypoints.push({ lon, lat })
+      }
+    })
+  }
+
+  return waypoints
+}
+
+// 生成单个航点的WPML格式
+function generateWaypointPlacemark (waypoint: {lon: number, lat: number}, index: number): string {
+  const executeHeight = 100 // 默认飞行高度100米，可以根据需要调整
+  const waypointSpeed = index === 0 ? 10 : 7 // 第一个点速度10m/s，其他点7m/s
+
+  return `
+      <Placemark>
+        <Point>
+          <coordinates>${waypoint.lon},${waypoint.lat}</coordinates>
+        </Point>
+        <wpml:index>${index}</wpml:index>
+        <wpml:executeHeight>${executeHeight}</wpml:executeHeight>
+        <wpml:waypointSpeed>${waypointSpeed}</wpml:waypointSpeed>
+        <wpml:waypointHeadingParam>
+          <wpml:waypointHeadingMode>followWayline</wpml:waypointHeadingMode>
+        </wpml:waypointHeadingParam>
+        <wpml:waypointTurnParam>
+          <wpml:waypointTurnMode>toPointAndStopWithDiscontinuityCurvature</wpml:waypointTurnMode>
+          <wpml:waypointTurnDampingDist>0</wpml:waypointTurnDampingDist>
+        </wpml:waypointTurnParam>
+        ${index === 1 ? generateActionGroup() : ''}
+      </Placemark>`
+}
+
+// 生成动作组（在第二个航点添加拍照动作）
+function generateActionGroup (): string {
+  return `
+        <wpml:actionGroup>
+          <wpml:actionGroupId>0</wpml:actionGroupId>
+          <wpml:actionGroupStartIndex>1</wpml:actionGroupStartIndex>
+          <wpml:actionGroupEndIndex>1</wpml:actionGroupEndIndex>
+          <wpml:actionGroupMode>sequence</wpml:actionGroupMode>
+          <wpml:actionTrigger>
+            <wpml:actionTriggerType>reachPoint</wpml:actionTriggerType>
+          </wpml:actionTrigger>
+          <wpml:action>
+            <wpml:actionId>0</wpml:actionId>
+            <wpml:actionActuatorFunc>gimbalRotate</wpml:actionActuatorFunc>
+            <wpml:actionActuatorFuncParam>
+              <wpml:gimbalRotateMode>absoluteAngle</wpml:gimbalRotateMode>
+              <wpml:gimbalPitchRotateEnable>0</wpml:gimbalPitchRotateEnable>
+              <wpml:gimbalPitchRotateAngle>0</wpml:gimbalPitchRotateAngle>
+              <wpml:gimbalRollRotateEnable>0</wpml:gimbalRollRotateEnable>
+              <wpml:gimbalRollRotateAngle>0</wpml:gimbalRollRotateAngle>
+              <wpml:gimbalYawRotateEnable>1</wpml:gimbalYawRotateEnable>
+              <wpml:gimbalYawRotateAngle>30</wpml:gimbalYawRotateAngle>
+              <wpml:gimbalRotateTimeEnable>0</wpml:gimbalRotateTimeEnable>
+              <wpml:gimbalRotateTime>0</wpml:gimbalRotateTime>
+              <wpml:payloadPositionIndex>0</wpml:payloadPositionIndex>
+            </wpml:actionActuatorFuncParam>
+          </wpml:action>
+          <wpml:action>
+            <wpml:actionId>1</wpml:actionId>
+            <wpml:actionActuatorFunc>takePhoto</wpml:actionActuatorFunc>
+            <wpml:actionActuatorFuncParam>
+              <wpml:fileSuffix>point${1}</wpml:fileSuffix>
+              <wpml:payloadPositionIndex>0</wpml:payloadPositionIndex>
+            </wpml:actionActuatorFuncParam>
+          </wpml:action>
+        </wpml:actionGroup>`
+}
 // ====== 新增导出 KMZ (WPML格式)功能 ======
 
 async function exportSelectedElementToKml () {
@@ -405,24 +503,21 @@ async function exportSelectedElementToKml () {
   }
 
   const nowStr = new Date().toISOString()
+  const timestamp = Date.now() // 当前时间戳，用于创建时间
 
   // 颜色转换为KML颜色格式 AABBGGRR
-  function colorToKmlHex (color: string): string {
-    if (!color.startsWith('#') || color.length !== 7) return 'ff0000ff' // 默认红色
-    const r = color.substr(1, 2)
-    const g = color.substr(3, 2)
-    const b = color.substr(5, 2)
-    return 'ff' + b + g + r
-  }
-  const kmlColor = colorToKmlHex(color)
+  const hexColor = color.replace('#', '')
+  const r = hexColor.substr(0, 2)
+  const g = hexColor.substr(2, 2)
+  const b = hexColor.substr(4, 2)
+  const kmlColor = `ff${b}${g}${r}` // KML颜色格式为AABBGGRR
 
-  // 生成KML几何字符串
-  function generateKmlGeometry (geometry: any) {
+  // 生成KML几何元素的函数（用于template.kml）
+  function generateKmlGeometry (geometry: any): string {
     const type = geometry.type
-    if (!geometry.coordinates) return ''
     if (type === 'Point') {
-      const [lng, lat] = geometry.coordinates
-      return `<Point><coordinates>${lng},${lat},0</coordinates></Point>`
+      const coords = geometry.coordinates.join(',') + ',0'
+      return `<Point><coordinates>${coords}</coordinates></Point>`
     }
     if (type === 'LineString') {
       const coords = geometry.coordinates.map((c: number[]) => c.join(',') + ',0').join(' ')
@@ -436,63 +531,169 @@ async function exportSelectedElementToKml () {
     return ''
   }
 
-  // template.kml（模板文件）
+  // template.kml（模板文件）- 保持原有格式
   const templateKmlContent = `<?xml version="1.0" encoding="UTF-8"?>
-  <kml xmlns="http://www.opengis.net/kml/2.2" xmlns:wpml="http://www.dji.com/wpml">
-    <Document>
-      <name>航线模板文件 - ${name}</name>
-      <description>Created on ${nowStr}</description>
-      <ExtendedData>
-        <Data name="version"><value>1.0</value></Data>
-        <Data name="created"><value>${nowStr}</value></Data>
-        <Data name="updated"><value>${nowStr}</value></Data>
-      </ExtendedData>
-      <wpml:missionConfig>
-        <wpml:missionType>CustomMission</wpml:missionType>
-        <wpml:flightAltitude>100</wpml:flightAltitude>
-        <wpml:overlap>70</wpml:overlap>
-      </wpml:missionConfig>
-      <Folder>
-        <name>模板航线</name>
-        <Placemark>
-          <name>${name}</name>
-          <styleUrl>#templateStyle</styleUrl>
-          ${generateKmlGeometry(geometry)}
-        </Placemark>
-      </Folder>
-      <Style id="templateStyle">
-        <LineStyle><color>${kmlColor}</color><width>3</width></LineStyle>
-        <PolyStyle><color>${kmlColor}</color></PolyStyle>
-        <IconStyle>
-          <color>${kmlColor}</color>
-          <scale>1.1</scale>
-          <Icon><href>http://maps.google.com/mapfiles/kml/shapes/placemark_circle.png</href></Icon>
-        </IconStyle>
-      </Style>
-    </Document>
-  </kml>`
+<kml xmlns="http://www.opengis.net/kml/2.2" xmlns:wpml="http://www.dji.com/wpmz/1.0.2">
+  <Document>
+    <wpml:author>DJI</wpml:author>
+    <wpml:createTime>${timestamp}</wpml:createTime>
+    <wpml:updateTime>${timestamp}</wpml:updateTime>
 
-  // waylines.wpml（执行文件）
-  const waylinesWpmlContent = `<?xml version="1.0" encoding="UTF-8"?>
-  <wpml:wpml xmlns:wpml="http://www.dji.com/wpml">
+    <!-- Step 2: Setup Mission Configuration -->
     <wpml:missionConfig>
-      <wpml:missionType>CustomMission</wpml:missionType>
-      <wpml:flightAltitude>100</wpml:flightAltitude>
-      <wpml:overlap>70</wpml:overlap>
+      <wpml:flyToWaylineMode>safely</wpml:flyToWaylineMode>
+      <wpml:finishAction>goHome</wpml:finishAction>
+      <wpml:exitOnRCLost>goContinue</wpml:exitOnRCLost>
+      <wpml:executeRCLostAction>hover</wpml:executeRCLostAction>
+      <wpml:takeOffSecurityHeight>20</wpml:takeOffSecurityHeight>
+      <wpml:takeOffRefPoint>23.98057,115.987663,100</wpml:takeOffRefPoint>
+      <wpml:takeOffRefPointAGLHeight>35</wpml:takeOffRefPointAGLHeight>
+      <wpml:globalTransitionalSpeed>8</wpml:globalTransitionalSpeed>
+      <wpml:droneInfo>
+        <wpml:droneEnumValue>67</wpml:droneEnumValue>
+        <wpml:droneSubEnumValue>0</wpml:droneSubEnumValue>
+      </wpml:droneInfo>
+      <wpml:payloadInfo>
+        <wpml:payloadEnumValue>52</wpml:payloadEnumValue>
+        <wpml:payloadPositionIndex>0</wpml:payloadPositionIndex>
+      </wpml:payloadInfo>
     </wpml:missionConfig>
+
+    <!-- Step 3: Setup A Folder for Waypoint Template -->
     <Folder>
-      <name>${name} 执行航线</name>
+      <wpml:templateType>waypoint</wpml:templateType>
+      <wpml:templateId>0</wpml:templateId>
+      <wpml:waylineCoordinateSysParam>
+        <wpml:coordinateMode>WGS84</wpml:coordinateMode>
+        <wpml:heightMode>EGM96</wpml:heightMode>
+        <wpml:globalShootHeight>50</wpml:globalShootHeight>
+        <wpml:positioningType>GPS</wpml:positioningType>
+        <wpml:surfaceFollowModeEnable>1</wpml:surfaceFollowModeEnable>
+        <wpml:surfaceRelativeHeight>100</wpml:surfaceRelativeHeight>
+      </wpml:waylineCoordinateSysParam>
+      <wpml:autoFlightSpeed>7</wpml:autoFlightSpeed>
+      <wpml:gimbalPitchMode>usePointSetting</wpml:gimbalPitchMode>
+      <wpml:globalWaypointHeadingParam>
+        <wpml:waypointHeadingMode>followWayline</wpml:waypointHeadingMode>
+        <wpml:waypointHeadingAngle>45</wpml:waypointHeadingAngle>
+        <wpml:waypointPoiPoint>24.323345,116.324532,31.000000</wpml:waypointPoiPoint>
+        <wpml:waypointHeadingPathMode>clockwise</wpml:waypointHeadingPathMode>
+      </wpml:globalWaypointHeadingParam>
+      <wpml:globalWaypointTurnMode>toPointAndStopWithDiscontinuityCurvature</wpml:globalWaypointTurnMode>
+      <wpml:globalUseStraightLine>0</wpml:globalUseStraightLine>
+
+      <!-- First Waypoint -->
       <Placemark>
-        <name>${name}</name>
-        ${generateKmlGeometry(geometry)}
+        <Point>
+          <coordinates>${layerState.longitude},${layerState.latitude},0</coordinates>
+        </Point>
+        <wpml:index>0</wpml:index>
+        <wpml:executeHeight>100</wpml:executeHeight>
+        <wpml:ellipsoidHeight>90.2</wpml:ellipsoidHeight>
+        <wpml:height>100</wpml:height>
+        <wpml:useGlobalHeight>1</wpml:useGlobalHeight>
+        <wpml:useGlobalSpeed>1</wpml:useGlobalSpeed>
+        <wpml:useGlobalHeadingParam>1</wpml:useGlobalHeadingParam>
+        <wpml:useGlobalTurnParam>1</wpml:useGlobalTurnParam>
+        <wpml:gimbalPitchAngle>0</wpml:gimbalPitchAngle>
+      </Placemark>
+
+      <!-- Second Waypoint -->
+      <Placemark>
+        <Point>
+          <coordinates>${layerState.longitude},${layerState.latitude},0</coordinates>
+        </Point>
+        <wpml:index>1</wpml:index>
+        <wpml:executeHeight>100</wpml:executeHeight>
+        <wpml:ellipsoidHeight>90.2</wpml:ellipsoidHeight>
+        <wpml:height>100</wpml:height>
+        <wpml:useGlobalHeight>1</wpml:useGlobalHeight>
+        <wpml:useGlobalSpeed>1</wpml:useGlobalSpeed>
+        <wpml:useGlobalHeadingParam>1</wpml:useGlobalHeadingParam>
+        <wpml:useGlobalTurnParam>1</wpml:useGlobalTurnParam>
+        <wpml:gimbalPitchAngle>0</wpml:gimbalPitchAngle>
+
+        <!-- Action group for waypoint -->
+        <wpml:actionGroup>
+          <wpml:actionGroupId>0</wpml:actionGroupId>
+          <wpml:actionGroupStartIndex>1</wpml:actionGroupStartIndex>
+          <wpml:actionGroupEndIndex>1</wpml:actionGroupEndIndex>
+          <wpml:actionGroupMode>sequence</wpml:actionGroupMode>
+          <wpml:actionTrigger>
+            <wpml:actionTriggerType>reachPoint</wpml:actionTriggerType>
+          </wpml:actionTrigger>
+          <wpml:action>
+            <wpml:actionId>0</wpml:actionId>
+            <wpml:actionActuatorFunc>gimbalRotate</wpml:actionActuatorFunc>
+            <wpml:actionActuatorFuncParam>
+              <wpml:gimbalYawRotateAngle>30</wpml:gimbalYawRotateAngle>
+            </wpml:actionActuatorFuncParam>
+          </wpml:action>
+          <wpml:action>
+            <wpml:actionId>1</wpml:actionId>
+            <wpml:actionActuatorFunc>takePhoto</wpml:actionActuatorFunc>
+            <wpml:actionActuatorFuncParam>
+              <wpml:fileSuffix>point1</wpml:fileSuffix>
+            </wpml:actionActuatorFuncParam>
+          </wpml:action>
+        </wpml:actionGroup>
       </Placemark>
     </Folder>
-  </wpml:wpml>`
+  </Document>
+</kml>`
+
+  // 将几何信息转换为航点
+  const waypoints = convertGeometryToWaypoints(geometry)
+
+  if (waypoints.length === 0) {
+    message.warning('无法从该元素提取有效航点')
+    return
+  }
+
+  // 生成航点列表
+  const waypointPlacemarks = waypoints.map((waypoint, index) =>
+    generateWaypointPlacemark(waypoint, index)
+  ).join('')
+
+  // waylines.wpml（执行文件）- 按照DJI标准格式
+  const waylinesWpmlContent = `<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2" xmlns:wpml="http://www.dji.com/wpmz/1.0.2">
+  <Document>
+    <!-- Step 1: Setup Mission Configuration -->
+    <wpml:missionConfig>
+      <wpml:flyToWaylineMode>safely</wpml:flyToWaylineMode>
+      <wpml:finishAction>goHome</wpml:finishAction>
+      <wpml:exitOnRCLost>goContinue</wpml:exitOnRCLost>
+      <wpml:executeRCLostAction>hover</wpml:executeRCLostAction>
+      <wpml:takeOffSecurityHeight>20</wpml:takeOffSecurityHeight>
+      <wpml:globalTransitionalSpeed>10</wpml:globalTransitionalSpeed>
+      <!-- Declare drone model with M30 -->
+      <wpml:droneInfo>
+        <wpml:droneEnumValue>67</wpml:droneEnumValue>
+        <wpml:droneSubEnumValue>0</wpml:droneSubEnumValue>
+      </wpml:droneInfo>
+      <!-- Declare payload model with M30 -->
+      <wpml:payloadInfo>
+        <wpml:payloadEnumValue>52</wpml:payloadEnumValue>
+        <wpml:payloadPositionIndex>0</wpml:payloadPositionIndex>
+      </wpml:payloadInfo>
+    </wpml:missionConfig>
+
+    <!-- Step 2: Setup A Folder for Waypoint Template -->
+    <Folder>
+      <wpml:templateId>0</wpml:templateId>
+      <wpml:executeHeightMode>WGS84</wpml:executeHeightMode>
+      <wpml:waylineId>0</wpml:waylineId>
+      <wpml:autoFlightSpeed>10</wpml:autoFlightSpeed>${waypointPlacemarks}
+    </Folder>
+
+  </Document>
+</kml>`
 
   const zip = new JSZip()
   zip.file('template.kml', templateKmlContent)
   zip.file('waylines.wpml', waylinesWpmlContent)
-  zip.folder('res') // 空资源文件夹，后续可加入辅助资源
+  zip.folder('res') // 空资源文件夹，符合DJI标准
 
   const content = await zip.generateAsync({ type: 'blob' })
 
@@ -502,6 +703,8 @@ async function exportSelectedElementToKml () {
   a.download = `${name}.kmz`
   a.click()
   URL.revokeObjectURL(url)
+
+  message.success(`成功导出 ${name}.kmz 文件（包含 ${waypoints.length} 个航点）`)
 }
 </script>
 
